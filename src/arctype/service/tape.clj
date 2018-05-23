@@ -98,15 +98,17 @@
                                                      (handler data)
                                                      true
                                                      (catch Exception e
-                                                       (log/error e {:message "Event handler failed"})
                                                        (if (:retry? options)
-                                                         false 
-                                                         true)))
+                                                         (do
+                                                           (log/debug e {:message "Retrying event handler"
+                                                                         :delay-ms (:retry-delay-ms options)})   
+                                                           false) 
+                                                         (do
+                                                           (log/error e {:message "Event handler failed"})
+                                                           true))))
                                                  true
                                                  (if @continue?
                                                    (do
-                                                     (log/debug {:message "Retrying event handler"
-                                                                 :delay-ms (:retry-delay-ms options)})
                                                      (Thread/sleep (:retry-delay-ms options))
                                                      (recur))
                                                    false)))]

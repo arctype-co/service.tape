@@ -76,6 +76,13 @@
   (put-event! [this topic data]
     (put! this topic data))
 
+  PEventConsumer
+  (start-event-consumer [this topic options handler]
+    {})
+
+  (stop-event-consumer [this handler]
+    nil)
+
   )
 
 (S/defn create

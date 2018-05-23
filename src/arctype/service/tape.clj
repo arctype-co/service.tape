@@ -20,15 +20,20 @@
 (def default-config
   {:write-buffer-size 32})
 
+(defn- undefined-queue
+  [topic queues]
+  (ex-info "Undefined topic"
+           {:topic topic
+            :topics (:keys queues)}))
+
 (defn put!
   [{:keys [queues encoder]} topic data]
   (if-let [queue-file (get queues topic)]
     (let [buf (encoder data)]
       (locking queue-file
-        (.add queue-file buf)))
-    (throw (ex-info "Can not put to undefined topic"
-                    {:topic topic
-                     :topics (:keys queues)}))))
+        (.add queue-file buf)
+        (.notify queue-file)))
+    (throw (undefined-queue topic queues))))
 
 (defn- open-queue
   [this queue-name]
@@ -58,7 +63,7 @@
         (throw (ex-info "Failed to make tape directory"
                         {:path path}))))))
 
-(defrecord TapeQ [config]
+(defrecord TapeQ [config queues decoder]
   PLifecycle
 
   (start [this]
@@ -78,22 +83,54 @@
 
   PEventConsumer
   (start-event-consumer [this topic options handler]
-    {})
+    (if-let [queue (get queues topic)]
+      (let [continue? (atom true)
+            stopped? (atom false)
+            thread (Thread.
+                     (fn []
+                       (while @continue?
+                         (try
+                           (if-let [next-bytes (locking queue (.peek queue))]
+                             (let [data (decoder next-bytes)]
+                               (try
+                                 (handler data)
+                                 (catch Exception e
+                                   (log/error e {:message "Event handler failed"})))
+                               (locking queue (.remove queue)))
+                             (locking queue (.wait queue)))
+                           (catch Exception e
+                             (log/fatal e {:message "QueueFile io/error"})
+                             (throw e))))
+                       (reset! stopped? true)))]
+        (.start thread)
+        {:thread thread
+         :continue? continue?
+         :stopped? stopped?
+         :queue queue
+         :options options})
+      (throw (undefined-queue topic queues))))
 
-  (stop-event-consumer [this handler]
-    nil)
+  (stop-event-consumer [this {:keys [thread continue? stopped? queue options]}]
+    (reset! continue? false)
+    (locking queue (.notify queue))
+    (.join thread (:stop-timeout-ms options))
+    (when-not @stopped?
+      (log/warn {:message "Event consumer stop timeout"
+                 :stop-timeout-ms (:stop-timeout-ms options)})))
 
   )
 
 (S/defn create
   [resource-name
    config :- Config
-   encoder :- S/Any ; (fn [dict] -> bytes) Data encoder)
+   encoder :- S/Any ; (fn [obj] -> bytes) Data encoder)
+   decoder :- S/Any ; (fn [bytes] -> obj)
    topics :- [S/Any]] ; list of keywords or string
   (let [config (merge default-config config)]
     (resource/make-resource
       (map->TapeQ
         {:config config
          :topics topics
-         :encoder encoder})
+         :encoder encoder
+         :decoder decoder})
       resource-name)))

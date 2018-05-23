@@ -91,12 +91,27 @@
                        (while @continue?
                          (try
                            (if-let [next-bytes (locking queue (.peek queue))]
-                             (let [data (decoder next-bytes)]
-                               (try
-                                 (handler data)
-                                 (catch Exception e
-                                   (log/error e {:message "Event handler failed"})))
-                               (locking queue (.remove queue)))
+                             (let [data (decoder next-bytes)
+                                   complete? (loop []
+                                               ; Continue to retry until continue? is disabled
+                                               (if (try
+                                                     (handler data)
+                                                     true
+                                                     (catch Exception e
+                                                       (log/error e {:message "Event handler failed"})
+                                                       (if (:retry? options)
+                                                         false 
+                                                         true)))
+                                                 true
+                                                 (if @continue?
+                                                   (do
+                                                     (log/debug {:message "Retrying event handler"
+                                                                 :delay-ms (:retry-delay-ms options)})
+                                                     (Thread/sleep (:retry-delay-ms options))
+                                                     (recur))
+                                                   false)))]
+                               (when complete?
+                                 (locking queue (.remove queue))))
                              (locking queue (.wait queue)))
                            (catch Exception e
                              (log/fatal e {:message "QueueFile io/error"})

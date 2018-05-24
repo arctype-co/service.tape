@@ -63,6 +63,41 @@
         (throw (ex-info "Failed to make tape directory"
                         {:path path}))))))
 
+(defn- run-event-consumer
+  [options queue handler continue? stopped? decoder]
+  (fn []
+    (while @continue?
+      (try
+        (if-let [next-bytes (locking queue (.peek queue))]
+          (let [data (decoder next-bytes)
+                complete? (loop []
+                            ; Continue to retry until continue? is disabled
+                            (if (try
+                                  (handler data)
+                                  true
+                                  (catch Exception e
+                                    (if (:retry? options)
+                                      (do
+                                        (log/debug e {:message "Retrying event handler"
+                                                      :delay-ms (:retry-delay-ms options)})   
+                                        false) 
+                                      (do
+                                        (log/error e {:message "Event handler failed"})
+                                        true))))
+                              true
+                              (if @continue?
+                                (do
+                                  (Thread/sleep (:retry-delay-ms options))
+                                  (recur))
+                                false)))]
+            (when complete?
+              (locking queue (.remove queue))))
+          (locking queue (.wait queue)))
+        (catch Exception e
+          (log/fatal e {:message "QueueFile io/error"})
+          (throw e))))
+    (reset! stopped? true)))
+
 (defrecord TapeQ [config queues decoder]
   PLifecycle
 
@@ -86,39 +121,7 @@
     (if-let [queue (get queues topic)]
       (let [continue? (atom true)
             stopped? (atom false)
-            thread (Thread.
-                     (fn []
-                       (while @continue?
-                         (try
-                           (if-let [next-bytes (locking queue (.peek queue))]
-                             (let [data (decoder next-bytes)
-                                   complete? (loop []
-                                               ; Continue to retry until continue? is disabled
-                                               (if (try
-                                                     (handler data)
-                                                     true
-                                                     (catch Exception e
-                                                       (if (:retry? options)
-                                                         (do
-                                                           (log/debug e {:message "Retrying event handler"
-                                                                         :delay-ms (:retry-delay-ms options)})   
-                                                           false) 
-                                                         (do
-                                                           (log/error e {:message "Event handler failed"})
-                                                           true))))
-                                                 true
-                                                 (if @continue?
-                                                   (do
-                                                     (Thread/sleep (:retry-delay-ms options))
-                                                     (recur))
-                                                   false)))]
-                               (when complete?
-                                 (locking queue (.remove queue))))
-                             (locking queue (.wait queue)))
-                           (catch Exception e
-                             (log/fatal e {:message "QueueFile io/error"})
-                             (throw e))))
-                       (reset! stopped? true)))]
+            thread (Thread. (run-event-consumer options queue handler continue? stopped? decoder))]
         (.start thread)
         {:thread thread
          :continue? continue?
